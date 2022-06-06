@@ -6,7 +6,7 @@
   :license  "Specify license here"
   :version "0.0.1"
   :serial t
-  :depends-on (#:yacc)
+  :depends-on (#:alexandria #:yacc)
   :components ((:file "c-lexer")
                (:file "c-parser")
                (:file "clips")))

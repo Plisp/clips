@@ -1,25 +1,20 @@
 int main(void) {
-    int i, j, n, total, how_many;
+    int mark;
 
-    printf("Enter how many: ");
-    scanf("%d", &how_many);
+    printf("Enter a mark: ");
+    scanf("%d", &mark);
 
-    n = 1;
-
-    while (n <= how_many) {
-        total = 0;
-        j = 1;
-
-        while (j <= n) {
-            i = 1;
-            while (i <= j) {
-                total = total + i;
-                i = i + 1;
-            }
-            j = j + 1;
-        }
-        printf("%d\n", total);
-        n = n + 1;
+    if (mark < 50) {
+        printf("FL\n");
+    } else if (mark < 65) {
+        printf("PS\n");
+    } else if (mark < 75) {
+        printf("CR\n");
+    } else if (mark < 85) {
+        printf("DN\n");
+    } else {
+        printf("HD\n");
     }
+
     return 0;
 }

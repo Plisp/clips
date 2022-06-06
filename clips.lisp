@@ -4,6 +4,7 @@
   (:use #:cl))
 (in-package #:clips)
 
+(defvar *label->string*) ; XXX this is dumb just pass it
 (defun main (filename)
   "Main entry point, converts a single main function (in FILENAME) to mips on stdout"
   (let ((*label->string* (make-hash-table)))
@@ -24,7 +25,6 @@
 
 ;;; ir to text
 
-(defvar *label->string*)
 (defun emit (decls)
   (format t ".text~%")
   (loop for fn-ir in decls
@@ -33,7 +33,7 @@
   (emit-data-segment))
 
 (defun emit-data-segment ()
-  (format t "~% .data~%" )
+  (format t "~%.data~%")
   (let ((*print-case* :downcase))
     (maphash (lambda (k v)
                (format t "~a: .asciiz \"~a\"~%" k v))
@@ -89,29 +89,52 @@ supports if/while/for/return"
   (let ((statements (delete-if (lambda (s) (eq (first s) 'weave-c::declaration))
                                statements-decls)))
     (loop for statement in statements
-          appending (translate-statement statement name))))
+          appending (translate-statement statement))))
 
-(defun translate-statement (statement fn-name)
-  (assert (eq (first statement) 'weave-c::statement))
+(defun translate-if (statement end-label)
+  (if (null statement)
+      () ; no else
+      (destructuring-bind (weave-c::statement (block/if &rest else-body))
+          statement
+        (declare (ignore weave-c::statement))
+        (if (eq block/if 'block) ; reached end of chain
+            `(,@(mapcan (lambda (l) (translate-statement l))
+                        else-body))
+            ;; translate condition
+            ;; translate body
+            ;; setup jump
+            ;;
+            (destructuring-bind (condition
+                                 (weave-c::statement (weave-c::block &rest if-body))
+                                 else)
+                else-body
+              (declare (ignore weave-c::statement weave-c::block))
+              (let ((else-label (gensym "IFELSEIF")))
+                `(,@(translate-expression condition else-label)
+                  ,@(mapcan (lambda (l) (translate-statement l))
+                            if-body)
+                  (b ,end-label)
+                  (label ,else-label)
+                  ,@(translate-if else end-label))))))))
+
+(defun translate-statement (statement)
   (let ((thing (second statement)))
     (case (first thing)
-      ;; TODO support else if
       (weave-c::if
        (destructuring-bind (condition
                             (weave-c::statement (weave-c::block &rest if-body))
-                            (_statement (_block &rest else-body)))
+                            else)
            (rest thing)
-         (declare (ignore weave-c::statement weave-c::block _statement _block))
-         ;; TODO can leave off else
+         (declare (ignore weave-c::statement weave-c::block))
+         ;;
          (let ((else-label (gensym "IFELSE"))
                (end-label (gensym "IFEND")))
            `(,@(translate-expression condition else-label)
-             ,@(mapcan (lambda (l) (translate-statement l fn-name))
+             ,@(mapcan (lambda (l) (translate-statement l))
                        if-body)
              (b ,end-label)
              (label ,else-label)
-             ,@(mapcan (lambda (l) (translate-statement l fn-name))
-                       else-body)
+             ,@(translate-if else end-label)
              (label ,end-label)))))
       ;; XXX translate these directly, assume sample code has no goto
       (weave-c::while
@@ -124,7 +147,7 @@ supports if/while/for/return"
                (exit-label (gensym "WHILEEXIT")))
            `((label ,loop-label)
              ,@(translate-expression condition exit-label)
-             ,@(mapcan (lambda (l) (translate-statement l fn-name))
+             ,@(mapcan (lambda (l) (translate-statement l))
                        while-body)
              (b ,loop-label)
              (label ,exit-label)))))
@@ -139,10 +162,10 @@ supports if/while/for/return"
                (exit-label (gensym "FOREXIT")))
            ;; TODO for decls
            `((:comment "for loop start")
-             ;; TODO initialization here
+             ;; TODO init code here
              (label ,loop-label)
              ,@(translate-expression condition exit-label)
-             ,@(mapcan (lambda (l) (translate-statement l fn-name))
+             ,@(mapcan (lambda (l) (translate-statement l))
                        for-body)
              ,@(translate-expression update-forms)
              (b ,loop-label)
@@ -153,7 +176,7 @@ supports if/while/for/return"
       (weave-c::return '((li $v0 0)
                          (jr $ra)))
 
-      (t (error "unimplemented")))))
+      (t (error "unimplemented, let plisp know")))))
 
 (defmacro with-tempvar ((tmp str) &body body)
   `(let ((,tmp (gensym ,str)))
@@ -179,7 +202,7 @@ supports if/while/for/return"
      (nconc code `((,(if (eq (first expr) ',op1) ',inst1 ',inst2)
                     ,(second expr) ,(third expr) ,destination)))))
 
-;; TODO conservatively allocate registers for subexpressions
+;; TODO conservatively allocate registers for subexprs
 (defun translate-expression (expr &optional destination)
   "Destination is either a exit/else jump label or a variable for storage"
   (if (not (listp expr))
@@ -201,10 +224,11 @@ supports if/while/for/return"
                 (list `(move ,(second expr) ,(third expr))))
                (t (error "third arg of assignment ~a not supported" (third expr)))))
         ;;((weave-c::post++))
+        ;;((weave-c::+=))
         ;;((weave-c::+-*/=))
 
         ;; arithmetic
-        ;; XXX assumes only third can be intermediates, needs a pass to eliminate constants
+        ;; TODO assumes only third can be intermediates, needs a pass to eliminate constants
         ((weave-c::+)
          (assert destination)
          (list `(,(if (integerp (third expr)) 'addi 'add)
@@ -268,16 +292,13 @@ supports if/while/for/return"
                  appending (case s
                              (:d
                               (let ((param (pop params)))
-                                (assert (and (listp param)
-                                             (stringp (second param)))
-                                        nil
-                                        "scanf operates on vars! not ~a" param)
                                 (setf param (second param))
                                 (list `(:comment ,(format nil "scan int into ~a" param))
                                       `(li $v0 5)
                                       '(syscall)
-                                      `(move ,param $v0)))))))
-          (t (error "function ~a not implemented" name)))))
+                                      `(move ,param $v0))))
+                             (t (error "not implemented, poke plisp")))))
+          (t (error "function ~a not implemented, tell plisp about it" name)))))
 
 ;;; utils, don't look
 
