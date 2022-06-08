@@ -482,7 +482,7 @@
         (extract 0 2 4 6 8))
    (for |(| declaration expression-opt |;| expression-opt |)| statement
         #'(lambda (a b c d e f g h) (declare (ignore b e g))
-            (list a (list 'for-decls c) d f h))))
+            (list a c d f h))))
 
   (jump-statement
    (goto identifier |;| (extract 0 1))

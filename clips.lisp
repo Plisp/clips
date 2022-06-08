@@ -7,28 +7,30 @@
 (defvar *label->string*) ; XXX this is dumb just pass it
 (defun main (filename)
   "Main entry point, converts a single main function (in FILENAME) to mips on stdout"
-  (let ((*label->string* (make-hash-table)))
-   (emit
-    (with-open-file (f filename)
-      (let ((ast (weave-c:parse-c-file f)))
-        (loop for decl in ast
-              ;; TODO handle variables, ignore prototypes
-              collect (destructuring-bind (weave-c::definition (_int)
-                                           (nil (_function name return-type)) nil
-                                           (_block &rest body))
-                          decl
-                        (declare (ignore weave-c::definition _int _function _block))
-                        return-type
-                        (let ((ir (function->ir name body)))
-                          (format t "translation of ~a~%~%" name)
-                          (pprint-translation ir)))))))))
+  (let ((*label->string* (make-hash-table))
+        (*gensym-counter* 0))
+    (emit
+     (with-open-file (f filename)
+       (let ((ast (weave-c:parse-c-file f)))
+         (loop
+           for decl in ast
+           ;; TODO handle variables, ignore prototypes
+           collect (destructuring-bind (_definition _qualified_type
+                                        (_ptr (_function name return-type)) nil
+                                        (_block &rest body))
+                       decl
+                     (declare (ignore _definition _qualified_type _ptr _function _block))
+                     return-type
+                     (let ((ir (function->ir name body)))
+                       (format t "translation of ~a~%~%" name)
+                       (pprint-translation ir)))))))))
 
 ;;; ir to text
 
 (defun emit (decls)
   (format t ".text~%")
   (loop for fn-ir in decls
-        do (format t "~a:~%" (getf fn-ir :name))
+        do (format t "~a:" (getf fn-ir :name))
            (emit-code fn-ir))
   (emit-data-segment))
 
@@ -49,28 +51,33 @@
               do (setf (getf ir :code)
                        (nsubst reg sym (getf ir :code) :test 'equal))))))
 
+(defvar *branch-insts* '(b bne beq bge ble blt bgt))
 (defun emit-code (fn-ir)
   (replace-vars->regs fn-ir)
   (loop for inst in (getf fn-ir :code)
-        do (case (first inst)
-             (:comment (format t "    # ~a~%" (second inst)))
-             (label (let ((*print-case* :downcase))
-                      (format t "~a:~%" (second inst))))
-             (t
-              (let ((*print-case* :downcase))
-                (format t "    ~4a ~{~a~^, ~}~%" (first inst) (rest inst)))))))
+        do (let ((*print-case* :downcase)
+                 (fn-name (getf fn-ir :name)))
+             ;; TODO output comment containing var to register translations
+             (case (first inst)
+               (:comment (format t "~&	# ~a~&" (second inst)))
+               (label (format t "~&~a_~a:~&" fn-name (second inst)))
+               (t
+                (when (member (first inst) *branch-insts*) ; 'fix' branch target name
+                  (setf (alexandria:lastcar inst)
+                        (format nil "~a_~a" fn-name (alexandria:lastcar inst))))
+                (format t "~&	~8a ~{~a~^, ~}~&" (first inst) (rest inst)))))))
 
 ;;; compiler internals
 
 (defvar *vars*)
 (defun function->ir (name statements-decls)
-  ;; TODO handle calling convention
+  ;; TODO handle callconv
   ;; XXX doesn't know about lexical vars (assume no name shadowing in sample code)
   (let* ((*vars* (mapcan (lambda (decl)
-                           (destructuring-bind (weave-c::declaration (type) &rest vars)
+                           (destructuring-bind (_declaration (type) &rest vars)
                                decl
-                             (declare (ignore weave-c::declaration))
-                             ;; TODO support other types?
+                             (declare (ignore _declaration))
+                             ;; TODO support other types? (calculate stack space here)
                              (assert (eq type 'weave-c::int))
                              (loop for x in vars
                                    collect (if (null (first x))
@@ -94,9 +101,9 @@ supports if/while/for/return"
 (defun translate-if (statement end-label)
   (if (null statement)
       () ; no else
-      (destructuring-bind (weave-c::statement (block/if &rest else-body))
+      (destructuring-bind (_statement (block/if &rest else-body))
           statement
-        (declare (ignore weave-c::statement))
+        (declare (ignore _statement))
         (if (eq block/if 'block) ; reached end of chain
             `(,@(mapcan (lambda (l) (translate-statement l))
                         else-body))
@@ -105,12 +112,12 @@ supports if/while/for/return"
             ;; setup jump
             ;;
             (destructuring-bind (condition
-                                 (weave-c::statement (weave-c::block &rest if-body))
-                                 else)
+                                 (_statement (_block &rest if-body))
+                                 &optional else)
                 else-body
-              (declare (ignore weave-c::statement weave-c::block))
+              (declare (ignore _statement _block))
               (let ((else-label (gensym "IFELSEIF")))
-                `(,@(translate-expression condition else-label)
+                `(,@(translate-expression condition :false-branch else-label)
                   ,@(mapcan (lambda (l) (translate-statement l))
                             if-body)
                   (b ,end-label)
@@ -122,14 +129,14 @@ supports if/while/for/return"
     (case (first thing)
       (weave-c::if
        (destructuring-bind (condition
-                            (weave-c::statement (weave-c::block &rest if-body))
-                            else)
+                            (_statement (_block &rest if-body))
+                            &optional else)
            (rest thing)
-         (declare (ignore weave-c::statement weave-c::block))
+         (declare (ignore _statement _block))
          ;;
          (let ((else-label (gensym "IFELSE"))
-               (end-label (gensym "IFEND")))
-           `(,@(translate-expression condition else-label)
+               (end-label (gensym "IFEXIT")))
+           `(,@(translate-expression condition :false-branch else-label)
              ,@(mapcan (lambda (l) (translate-statement l))
                        if-body)
              (b ,end-label)
@@ -139,37 +146,40 @@ supports if/while/for/return"
       ;; XXX translate these directly, assume sample code has no goto
       (weave-c::while
        (destructuring-bind (condition
-                            (weave-c::statement
-                             (_block &rest while-body)))
+                            (_statement (_block &rest while-body)))
            (rest thing)
-         (declare (ignore weave-c::statement _block))
+         (declare (ignore _statement _block))
          (let ((loop-label (gensym "WHILE"))
                (exit-label (gensym "WHILEEXIT")))
            `((label ,loop-label)
-             ,@(translate-expression condition exit-label)
+             ,@(translate-expression condition :false-branch exit-label)
              ,@(mapcan (lambda (l) (translate-statement l))
                        while-body)
              (b ,loop-label)
              (label ,exit-label)))))
 
       (weave-c::for
-       (destructuring-bind (for-decls condition update-forms
-                            (weave-c::statement
-                             (_block &rest for-body)))
+       (destructuring-bind (for-decl condition update-forms
+                            (_statement (_block &rest for-body)))
            (rest thing)
-         (declare (ignore for-decls weave-c::statement _block))
+         (declare (ignore _statement _block))
          (let ((loop-label (gensym "FOR"))
                (exit-label (gensym "FOREXIT")))
-           ;; TODO for decls
-           `((:comment "for loop start")
-             ;; TODO init code here
-             (label ,loop-label)
-             ,@(translate-expression condition exit-label)
-             ,@(mapcan (lambda (l) (translate-statement l))
-                       for-body)
-             ,@(translate-expression update-forms)
-             (b ,loop-label)
-             (label ,exit-label)))))
+           ;; XXX single declaration for now. multiple looks like:
+           ;; (_declaration (_type) &rest ((_ptr name) (_expression expr)))
+           (destructuring-bind (_declaration _qualified_type
+                                ((_ptr name) (_expression expr)))
+               for-decl
+             (declare (ignore _declaration _qualified_type _ptr _expression))
+             `((:comment "for loop start")
+               ,@(translate-expression `(= ,name ,expr))
+               (label ,loop-label)
+               ,@(translate-expression condition :false-branch exit-label)
+               ,@(mapcan (lambda (l) (translate-statement l))
+                         for-body)
+               ,@(translate-expression update-forms)
+               (b ,loop-label)
+               (label ,exit-label))))))
 
       (weave-c::expression (translate-expression (second thing)))
 
@@ -183,27 +193,39 @@ supports if/while/for/return"
      (push ,tmp *vars*)
      ,@body))
 
-(defmacro expand-comparision (op1 op2 inst1 inst2)
-  (declare (ignore op2))
+(defmacro expand-comparision (inst)
   `(let ((code (list `(:comment ,(let ((*package* (find-package '#:weave-c))) ; XXX hack
                                    (format nil "~a ~a ~a"
                                            (second expr) (first expr) (third expr)))))))
-     (assert destination)
+     (assert false-branch)
      (when (listp (second expr))
-       (with-tempvar (tmp "CMPTEMP")
-         (setf code (nconc code `(,@(translate-expression (second expr) tmp))))
+       (with-tempvar (tmp "CMPTMP")
+         (setf code (nconc code `(,@(translate-expression (second expr) :target tmp))))
          (setf (second expr) tmp)))
      ;;
      (when (listp (third expr))
-       (with-tempvar (tmp "CMPTEMP")
-         (setf code (nconc code `(,@(translate-expression (third expr) tmp))))
+       (with-tempvar (tmp "CMPTMP")
+         (setf code (nconc code `(,@(translate-expression (third expr) :target tmp))))
          (setf (third expr) tmp)))
      ;; actual comparision, may use immediates
-     (nconc code `((,(if (eq (first expr) ',op1) ',inst1 ',inst2)
-                    ,(second expr) ,(third expr) ,destination)))))
+     (nconc code `((,',inst ,(second expr) ,(third expr) ,false-branch)))))
 
-;; TODO conservatively allocate registers for subexprs
-(defun translate-expression (expr &optional destination)
+(defmacro expand-binary-op (inst)
+  `(let ((code (list)))
+     (assert target)
+     (when (listp (second expr))
+       (with-tempvar (tmp "TMP")
+         (setf code (nconc code `(,@(translate-expression (second expr) :target tmp))))
+         (setf (second expr) tmp)))
+     ;;
+     (when (listp (third expr))
+       (with-tempvar (tmp "TMP")
+         (setf code (nconc code `(,@(translate-expression (third expr) :target tmp))))
+         (setf (third expr) tmp)))
+     ;; actual comparision, may use immediates
+     (nconc code `((,',inst ,target ,(second expr) ,(third expr))))))
+
+(defun translate-expression (expr &key false-branch target)
   "Destination is either a exit/else jump label or a variable for storage"
   (if (not (listp expr))
       (warn "doing nothing for ~a" expr)
@@ -215,40 +237,65 @@ supports if/while/for/return"
          (cond ((listp (third expr)) ; assignment to expression
                 ;; tmp = (third expr)
                 ;; (second expr) = tmp
-                (with-tempvar (tmp "ASSIGNTEMP")
-                  `(,@(translate-expression (third expr) tmp)
+                (with-tempvar (tmp "ASSIGNTMP")
+                  `(,@(translate-expression (third expr) :target tmp)
                     (move ,(second expr) ,tmp))))
                ((integerp (third expr))
                 (list `(li ,(second expr) ,(third expr))))
                ((stringp (third expr))
                 (list `(move ,(second expr) ,(third expr))))
                (t (error "third arg of assignment ~a not supported" (third expr)))))
-        ;;((weave-c::post++))
-        ;;((weave-c::+=))
-        ;;((weave-c::+-*/=))
-
+        ;; TODO unary ops, mostly - and ~ and ! (manual translate?)
+        ;; TODO be careful with post++, the expression value is not the original, so
+        ;; just manually convert for now
+        ((weave-c::++) (list `(add ,(second expr) ,(second expr) 1)))
+        ((weave-c::--) (list `(sub ,(second expr) ,(second expr) 1)))
+        ;; compound assignment ops: XXX don't need the others
+        ((weave-c::+=) (translate-expression
+                        `(weave-c::= ,(second expr)
+                                     (weave-c::+ ,(second expr) ,(third expr)))))
+        ((weave-c::-=) (translate-expression
+                        `(weave-c::= ,(second expr)
+                                     (weave-c::- ,(second expr) ,(third expr)))))
+        ((weave-c::*=) (translate-expression
+                        `(weave-c::= ,(second expr)
+                                     (weave-c::* ,(second expr) ,(third expr)))))
+        ((weave-c::/=) (translate-expression
+                        `(weave-c::= ,(second expr)
+                                     (weave-c::/ ,(second expr) ,(third expr)))))
         ;; arithmetic
-        ;; TODO assumes only third can be intermediates, needs a pass to eliminate constants
-        ((weave-c::+)
-         (assert destination)
-         (list `(,(if (integerp (third expr)) 'addi 'add)
-                 ,destination
-                 ,(second expr)
-                 ,(third expr))))
-        ((weave-c::%)
-         (assert destination)
-         (list `(rem ,destination ,(second expr) ,(third expr))))
-        ;;((weave-c::-))
-        ;;((weave-c::/))
-
+        ((weave-c::+)  (expand-binary-op add))
+        ((weave-c::-)  (expand-binary-op sub))
+        ((weave-c::*)  (expand-binary-op mul))
+        ((weave-c::/)  (expand-binary-op div))
+        ((weave-c::%)  (expand-binary-op rem))
+        ((weave-c::&)  (expand-binary-op xor))
+        ((weave-c::\|) (expand-binary-op or))
+        ((weave-c::^)  (expand-binary-op xor))
+        ((weave-c::<<) (expand-binary-op sllv))
+        ((weave-c::>>) (expand-binary-op srav))
+        ;; logical operators
+        ;; XXX will not handle things that aren't comparisions e.g. while(curr) = bad style
+        ;; XXX no branchfree shenanigans
+        ((weave-c::&&)
+         (assert false-branch)
+         `(,@(translate-expression (second expr) :false-branch false-branch)
+           ,@(translate-expression (third expr)  :false-branch false-branch)))
+        ;; careful optimizing, this is subtle. compilers like to fall thru on last branch
+        ((weave-c::\|\|)
+         (assert false-branch)
+         (let ((tmp (gensym "ORTRUE")))
+           `(,@(translate-expression (second expr) :false-branch tmp)
+             ,@(translate-expression (third expr)  :false-branch tmp)
+             (b ,false-branch)
+             (label ,tmp))))
         ;; comparisions
-        ;; XXX assumes a destination for now, no branchfree shenanigans
-        ((weave-c::== weave-c::!=)
-         (expand-comparision weave-c::== weave-c::!= beq bne))
-        ((weave-c::< weave-c::>=)
-         (expand-comparision weave-c::< weave-c::>= bge blt))
-        ((weave-c::> weave-c::<=)
-         (expand-comparision weave-c::> weave-c::<= ble bgt))
+        ((weave-c::==) (expand-comparision bne))
+        ((weave-c::!=) (expand-comparision beq))
+        ((weave-c::<)  (expand-comparision bge))
+        ((weave-c::>)  (expand-comparision ble))
+        ((weave-c::>=) (expand-comparision blt))
+        ((weave-c::<=) (expand-comparision bgt))
         (t
          (warn "operator ~a unimplemented, knock on plisp's window TODO" (first expr))
          (list :todo expr :thing)))))
@@ -267,7 +314,7 @@ supports if/while/for/return"
                  appending (if (stringp s)
                                (let ((label (gensym "PRINTFARG")))
                                  (setf (gethash label *label->string*) s)
-                                 (list `(:comment ,(format nil "print: ~a" s))
+                                 (list `(:comment ,(format nil "print \"~a\"" s))
                                        `(la $a0 ,label)
                                        `(li $v0 4)
                                        '(syscall)))
@@ -275,7 +322,7 @@ supports if/while/for/return"
                                  (:d
                                   (let ((param (pop params)))
                                     (if (stringp param)
-                                        (list `(:comment ,(format nil "print: ~a" param))
+                                        (list `(:comment ,(format nil "print \"~a\"" param))
                                               `(move $a0 ,param)
                                               `(li $v0 1)
                                               '(syscall))
@@ -290,9 +337,8 @@ supports if/while/for/return"
            (loop for s in (tokenizef (second (first args)))
                  with params = (rest args)
                  appending (case s
-                             (:d
-                              (let ((param (pop params)))
-                                (setf param (second param))
+                             (:d ; (& "var")
+                              (let ((param (second (pop params))))
                                 (list `(:comment ,(format nil "scan int into ~a" param))
                                       `(li $v0 5)
                                       '(syscall)
@@ -324,8 +370,7 @@ supports if/while/for/return"
                  (incf i))))
              (t
               (if (stringp (first res))
-                  (setf (first res)
-                        (concatenate 'string (first res) (string (char fmt i))))
+                  (setf (first res) (uiop:strcat (first res) (char fmt i)))
                   (push (string (char fmt i)) res))
               (incf i)))
         finally (return (nreverse res))))
