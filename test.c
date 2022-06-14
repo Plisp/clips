@@ -1,25 +1,34 @@
 int main(void) {
-    int i, j, n, total, how_many;
+    int i;
+    int numbers[10] = { 0 };
+    int swapped;
+	int x,y;
 
-    printf("Enter how many: ");
-    scanf("%d", &how_many);
-
-    n = 1;
-
-    while (n <= how_many) {
-        total = 0;
-        j = 1;
-
-        while (j <= n || j > i) {
-            i = 1;
-            while (i <= j) {
-                total = total + i;
-                i = i + 1;
-            }
-            j = j + 1;
-        }
-        printf("%d\n", total);
-        n = n + 1;
+    i = 0;
+    while (i < 10) {
+        scanf("%d", &numbers[i]);
+        ++i;
     }
-    return 0;
+
+	swapped = 1;
+    while (swapped == 1) {
+        swapped = 0;
+        i = 1;
+        while (i < 10) {
+            x = numbers[i];
+            y = numbers[i - 1];
+            if (x < y) {
+                numbers[i] = y;
+                numbers[i - 1] = x;
+                swapped = 1;
+            }
+            ++i;
+        }
+    }
+
+    i = 0;
+    while (i < 10) {
+        printf("%d\n", numbers[i]);
+        ++i;
+    }
 }

@@ -1,6 +1,5 @@
 # clips
 
-A (preprocessed) C to MIPS compiler in Common Lisp.
+A (preprocessed subset of) C to MIPS compiler in Common Lisp. More of a simple learning exercise to cheese 1521 labs and get back into coding in preparation real compiler writing soon.
 
-If there are plagiarism issues then I'll add a machine learning model to generate
-random comments ;p
+I take no responsibility for any use of this code ;p

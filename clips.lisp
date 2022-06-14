@@ -14,21 +14,18 @@
        (let ((ast (weave-c:parse-c-file f)))
          (loop
            for decl in ast
-           ;; TODO handle variables, ignore prototypes
+           ;; TODO handle static variables, ignore prototypes
            collect (destructuring-bind (_definition _qualified_type
                                         (_ptr (_function name return-type)) nil
                                         (_block &rest body))
                        decl
-                     (declare (ignore _definition _qualified_type _ptr _function _block))
-                     return-type
-                     (let ((ir (function->ir name body)))
-                       (format t "translation of ~a~%~%" name)
-                       (pprint-translation ir)))))))))
+                     (declare (ignore _definition _qualified_type _ptr _function _block
+                                      return-type))
+                     (function->ir name body))))))))
 
 ;;; ir to text
 
 (defun emit (decls)
-  (format t ".text~%")
   (loop for fn-ir in decls
         do (format t "~a:" (getf fn-ir :name))
            (emit-code fn-ir))
@@ -41,31 +38,38 @@
                (format t "~a: .asciiz \"~a\"~%" k v))
              *label->string*)))
 
-(defun replace-vars->regs (ir)
-  (let ((vars (getf ir :vars)))
-    (if (> (length vars) 10)
-        (error "TOO MANY VARS: remind plisp to implement register spilling TODO")
-        (loop for i below 10
-              for sym in vars
-              for reg = (concatenate 'string "$t" (princ-to-string i))
-              do (setf (getf ir :code)
-                       (nsubst reg sym (getf ir :code) :test 'equal))))))
+;; Hacky I know but I'm not working on scope as this is a simple toy.
+(defparameter *regs*
+  '($t0 $t1 $t2 $t3 $t4 $t5 $t6 $t6 $t7 $t8 $t9 #|$a0 used by io|# $a1 $a2 $a3
+    $s0 $s1 $s2 $s4 $s5)
+  "TODO saved registers should be saved and restored by the prologue. right now just hack")
 
-(defvar *branch-insts* '(b bne beq bge ble blt bgt))
+(defun replace-vars (code vars)
+  (if (> (length vars) (length *regs*))
+      (error "TOO MANY VARS: remind plisp to implement register spilling TODO")
+      (loop for i below (length *regs*)
+            for sym in vars
+            for reg in *regs*
+            do (setf code (nsubst reg sym code :test 'equal))
+            finally (return code))))
+
+(defparameter *branch-insts* '(b bne beq bge ble blt bgt))
 (defun emit-code (fn-ir)
-  (replace-vars->regs fn-ir)
-  (loop for inst in (getf fn-ir :code)
-        do (let ((*print-case* :downcase)
-                 (fn-name (getf fn-ir :name)))
-             ;; TODO output comment containing var to register translations
-             (case (first inst)
-               (:comment (format t "~&	# ~a~&" (second inst)))
-               (label (format t "~&~a_~a:~&" fn-name (second inst)))
-               (t
-                (when (member (first inst) *branch-insts*) ; 'fix' branch target name
-                  (setf (alexandria:lastcar inst)
-                        (format nil "~a_~a" fn-name (alexandria:lastcar inst))))
-                (format t "~&	~8a ~{~a~^, ~}~&" (first inst) (rest inst)))))))
+  (let ((code
+          (replace-vars (append (getf fn-ir :prologue) (getf fn-ir :code))
+                        (getf fn-ir :vars))))
+    (loop for inst in code
+          do (let ((*print-case* :downcase)
+                   (fn-name (getf fn-ir :name)))
+               ;; TODO output comment containing var to register translations
+               (case (first inst)
+                 (:comment (format t "~&	# ~a~&" (second inst)))
+                 (label (format t "~&~a_~a:~&" fn-name (second inst)))
+                 (t
+                  (when (member (first inst) *branch-insts*) ; 'fix' branch target name
+                    (setf (alexandria:lastcar inst)
+                          (format nil "~a_~a" fn-name (alexandria:lastcar inst))))
+                  (format t "~&	~8a ~{~a~^, ~}~&" (first inst) (rest inst))))))))
 
 ;;; compiler internals
 
@@ -73,20 +77,48 @@
 (defun function->ir (name statements-decls)
   ;; TODO handle callconv
   ;; XXX doesn't know about lexical vars (assume no name shadowing in sample code)
-  (let* ((*vars* (mapcan (lambda (decl)
-                           (destructuring-bind (_declaration (type) &rest vars)
-                               decl
-                             (declare (ignore _declaration))
-                             ;; TODO support other types? (calculate stack space here)
-                             (assert (eq type 'weave-c::int))
-                             (loop for x in vars
-                                   collect (if (null (first x))
-                                               (second x)
-                                               (second (first x)))))) ; assignment
-                         (traverse-match statements-decls 'weave-c::declaration)))
+  (let* ((stack-size 0) ; XXX I don't think I actually need to clean up the stack here
+         (prologue (list))
+         (*vars*
+           (mapcan (lambda (decl)
+                     (destructuring-bind (_declaration (type) &rest vars)
+                         decl
+                       (declare (ignore _declaration))
+                       ;; TODO support other types (bool, char, double)
+                       (assert (eq type 'weave-c::int))
+                       (loop
+                         for var in vars
+                         collect (if (stringp (second var))
+                                     ;; integer
+                                     (if (null (first var))
+                                         (second var)
+                                         (second (first var)))
+                                     ;; pointer (array N _qualifiers "var")
+                                     (destructuring-bind (_array n _qualifiers name)
+                                         (second (first var))
+                                       (declare (ignore _array _qualifiers))
+                                       (let ((init (gensym "INITSTART"))
+                                             (init-end (gensym "INITEND")))
+                                         (incf stack-size (* n 4))
+                                         (setf prologue
+                                               (nconc prologue
+                                                      `((li $t0 0)
+                                                        (label ,init)
+                                                        (bge $t0 ,n ,init-end)
+                                                        ;; store zero to stack and inc
+                                                        (sw $zero ($sp))
+                                                        (add $sp $sp -4)
+                                                        (add $t0 $t0 1)
+                                                        (b ,init)
+                                                        (label ,init-end)
+                                                        (move ,name $sp)
+                                                        (:comment "body begins..."))))
+                                         name))))))
+                   (traverse-match statements-decls 'weave-c::declaration)))
          (statements (translate-fn-def statements-decls name)))
     (list :name name
-          :vars *vars*
+          :vars (print *vars*)
+          :prologue prologue
           :code statements)))
 
 (defun translate-fn-def (statements-decls name)
@@ -232,57 +264,75 @@ supports if/while/for/return"
       (case (first expr)
         (apply (translate-call expr))
         ;; assignment
+        ;; TODO XXX assign to array (= (aref "array" (+/- "index" immediate)) expr)
         (weave-c::=
-         (assert (stringp (second expr)) nil "only var = * supported. todo ptr lvalues")
-         (cond ((listp (third expr)) ; assignment to expression
-                ;; tmp = (third expr)
-                ;; (second expr) = tmp
-                (with-tempvar (tmp "ASSIGNTMP")
-                  `(,@(translate-expression (third expr) :target tmp)
-                    (move ,(second expr) ,tmp))))
-               ((integerp (third expr))
-                (list `(li ,(second expr) ,(third expr))))
-               ((stringp (third expr))
-                (list `(move ,(second expr) ,(third expr))))
-               (t (error "third arg of assignment ~a not supported" (third expr)))))
+         (if (stringp (second expr))
+             (cond ((listp (third expr)) ; assignment to expression
+                    ;; tmp = (third expr)
+                    ;; (second expr) = tmp
+                    (with-tempvar (tmp "ASSIGNTMP")
+                      `(,@(translate-expression (third expr) :target tmp)
+                        (move ,(second expr) ,tmp))))
+                   ((integerp (third expr))
+                    (list `(li ,(second expr) ,(third expr))))
+                   ((stringp (third expr))
+                    (list `(move ,(second expr) ,(third expr))))
+                   (t (error "third arg of assignment ~a not supported" (third expr))))
+             ;; array! (= (AREF "numbers" (+ "i" 1)) "y")
+             ;; XXX HACK should use pointers
+             (let* ((value (third expr))
+                    (expr (second expr))
+                    (code))
+               (with-tempvar (val "TMP")
+                 (when (listp (third expr))
+                   (with-tempvar (tmp "TMP")
+                     (setf code
+                           (nconc code `(,@(translate-expression (third expr) :target tmp))))
+                     (setf (third expr) tmp)))
+                 ;; we need to compute the pointer to load from
+                 (with-tempvar (tmp "OFFSETTMP")
+                   `(,@code
+                     (mul ,tmp ,(third expr) 4) ; int
+                     (add ,tmp ,(second expr) ,tmp)
+                     (sw ,value (,tmp))))))))
         ;; TODO unary ops, mostly - and ~ and ! (manual translate?)
         ;; TODO be careful with post++, the expression value is not the original, so
         ;; just manually convert for now
-        ((weave-c::++) (list `(add ,(second expr) ,(second expr) 1)))
-        ((weave-c::--) (list `(sub ,(second expr) ,(second expr) 1)))
+        (weave-c::++ (list `(add ,(second expr) ,(second expr) 1)))
+        (weave-c::-- (list `(sub ,(second expr) ,(second expr) 1)))
         ;; compound assignment ops: XXX don't need the others
-        ((weave-c::+=) (translate-expression
+        (weave-c::+= (translate-expression
                         `(weave-c::= ,(second expr)
                                      (weave-c::+ ,(second expr) ,(third expr)))))
-        ((weave-c::-=) (translate-expression
+        (weave-c::-= (translate-expression
                         `(weave-c::= ,(second expr)
                                      (weave-c::- ,(second expr) ,(third expr)))))
-        ((weave-c::*=) (translate-expression
+        (weave-c::*= (translate-expression
                         `(weave-c::= ,(second expr)
                                      (weave-c::* ,(second expr) ,(third expr)))))
-        ((weave-c::/=) (translate-expression
+        (weave-c::/= (translate-expression
                         `(weave-c::= ,(second expr)
                                      (weave-c::/ ,(second expr) ,(third expr)))))
         ;; arithmetic
-        ((weave-c::+)  (expand-binary-op add))
-        ((weave-c::-)  (expand-binary-op sub))
-        ((weave-c::*)  (expand-binary-op mul))
-        ((weave-c::/)  (expand-binary-op div))
-        ((weave-c::%)  (expand-binary-op rem))
-        ((weave-c::&)  (expand-binary-op xor))
-        ((weave-c::\|) (expand-binary-op or))
-        ((weave-c::^)  (expand-binary-op xor))
-        ((weave-c::<<) (expand-binary-op sllv))
-        ((weave-c::>>) (expand-binary-op srav))
+        (weave-c::+  (expand-binary-op add))
+        (weave-c::-  (expand-binary-op sub))
+        (weave-c::*  (expand-binary-op mul))
+        (weave-c::/  (expand-binary-op div))
+        (weave-c::%  (expand-binary-op rem))
+        (weave-c::&  (expand-binary-op xor))
+        (weave-c::\| (expand-binary-op or))
+        (weave-c::^  (expand-binary-op xor))
+        (weave-c::<< (expand-binary-op sllv))
+        (weave-c::>> (expand-binary-op srav))
         ;; logical operators
         ;; XXX will not handle things that aren't comparisions e.g. while(curr) = bad style
         ;; XXX no branchfree shenanigans
-        ((weave-c::&&)
+        (weave-c::&&
          (assert false-branch)
          `(,@(translate-expression (second expr) :false-branch false-branch)
            ,@(translate-expression (third expr)  :false-branch false-branch)))
         ;; careful optimizing, this is subtle. compilers like to fall thru on last branch
-        ((weave-c::\|\|)
+        (weave-c::\|\|
          (assert false-branch)
          (let ((tmp (gensym "ORTRUE")))
            `(,@(translate-expression (second expr) :false-branch tmp)
@@ -290,17 +340,35 @@ supports if/while/for/return"
              (b ,false-branch)
              (label ,tmp))))
         ;; comparisions
-        ((weave-c::==) (expand-comparision bne))
-        ((weave-c::!=) (expand-comparision beq))
-        ((weave-c::<)  (expand-comparision bge))
-        ((weave-c::>)  (expand-comparision ble))
-        ((weave-c::>=) (expand-comparision blt))
-        ((weave-c::<=) (expand-comparision bgt))
+        (weave-c::== (expand-comparision bne))
+        (weave-c::!= (expand-comparision beq))
+        (weave-c::<  (expand-comparision bge))
+        (weave-c::>  (expand-comparision ble))
+        (weave-c::>= (expand-comparision blt))
+        (weave-c::<= (expand-comparision bgt))
+        ;; XXX eww
+        (weave-c::aref
+         (let ((code
+                 (list `(:comment ,(let ((*package* (find-package '#:weave-c))) ; XXX hack
+                                     (format nil "~a ~a ~a"
+                                             'aref (first expr) (third expr)))))))
+           (with-tempvar (val "TMP")
+             (when (listp (third expr))
+               (with-tempvar (tmp "TMP")
+                 (setf code
+                       (nconc code `(,@(translate-expression (third expr) :target tmp))))
+                 (setf (third expr) tmp)))
+             ;; we need to compute the pointer to load from
+             (with-tempvar (tmp "OFFSETTMP")
+               `(,@code
+                 (mul ,tmp ,(third expr) 4) ; int
+                 (add ,tmp ,(second expr) ,tmp)
+                 (lw ,target (,tmp)))))))
         (t
          (warn "operator ~a unimplemented, knock on plisp's window TODO" (first expr))
          (list :todo expr :thing)))))
 
-;; TODO handle calling convention
+;; TODO handle calling convention (caller)
 (defun translate-call (thing)
   ;; parse looks smth like "(APPLY "scanf" ((STRING "%d") (WEAVE-C::& "number")))"
   (let ((name (second thing))
@@ -309,27 +377,38 @@ supports if/while/for/return"
            ;; XXX assume string constant
            (assert (and (listp (first args))
                         (eq (first (first args)) 'string)))
-           (loop for s in (tokenizef (second (first args)))
-                 with params = (rest args)
-                 appending (if (stringp s)
-                               (let ((label (gensym "PRINTFARG")))
-                                 (setf (gethash label *label->string*) s)
-                                 (list `(:comment ,(format nil "print \"~a\"" s))
-                                       `(la $a0 ,label)
-                                       `(li $v0 4)
-                                       '(syscall)))
-                               (case s
-                                 (:d
-                                  (let ((param (pop params)))
-                                    (if (stringp param)
-                                        (list `(:comment ,(format nil "print \"~a\"" param))
-                                              `(move $a0 ,param)
-                                              `(li $v0 1)
-                                              '(syscall))
-                                        ;; constant number
-                                        (list `(li $a0 ,param)
-                                              `(li $v0 1)
-                                              '(syscall)))))))))
+           (loop
+             for s in (tokenizef (second (first args)))
+             with params = (rest args)
+             appending (if (stringp s)
+                           (let ((label (gensym "PRINTFARG")))
+                             (setf (gethash label *label->string*) s)
+                             (list `(:comment ,(format nil "print \"~a\"" s))
+                                   `(la $a0 ,label)
+                                   `(li $v0 4)
+                                   '(syscall)))
+                           (case s
+                             (:d
+                              (let ((param (pop params)))
+                                (cond ((stringp param)
+                                       (list `(:comment
+                                               ,(format nil "print \"~a\"" param))
+                                             `(move $a0 ,param)
+                                             '(li $v0 1)
+                                              '(syscall)))
+                                      ;; constant number
+                                      ((integerp param)
+                                       (list `(li $a0 ,param)
+                                             '(li $v0 1)
+                                              '(syscall)))
+                                      ;; array index (aref "a" "test")
+                                      (t
+                                       (with-tempvar (tmp "OFFSETTMP")
+                                         `((mul ,tmp ,(third param) 4)
+                                           (add ,tmp ,(second param) ,tmp)
+                                           (lw $a0 (,tmp))
+                                           (li $v0 1)
+                                           (syscall)))))))))))
           ;; XXX assume only single integers and chars for now
           ((string= name "scanf")
            (assert (and (listp (first args))
@@ -339,10 +418,19 @@ supports if/while/for/return"
                  appending (case s
                              (:d ; (& "var")
                               (let ((param (second (pop params))))
-                                (list `(:comment ,(format nil "scan int into ~a" param))
-                                      `(li $v0 5)
-                                      '(syscall)
-                                      `(move ,param $v0))))
+                                (if (stringp param)
+                                    `((:comment ,(format nil "scan int into ~a" param))
+                                      (li $v0 5)
+                                      (syscall)
+                                      (move ,param $v0))
+                                    ;; array index (aref "a" "test")
+                                    (with-tempvar (tmp "OFFSETTMP")
+                                      `((:comment ,(format nil "scan int into ~a" param))
+                                        (li $v0 5)
+                                        (syscall)
+                                        (mul ,tmp ,(third param) 4)
+                                        (add ,tmp ,(second param) ,tmp)
+                                        (sw $v0 (,tmp)))))))
                              (t (error "not implemented, poke plisp")))))
           (t (error "function ~a not implemented, tell plisp about it" name)))))
 
@@ -374,8 +462,3 @@ supports if/while/for/return"
                   (push (string (char fmt i)) res))
               (incf i)))
         finally (return (nreverse res))))
-
-(defun pprint-translation (ir)
-  (loop for x in (getf ir :statements)
-        do (princ x) (terpri))
-  ir)
