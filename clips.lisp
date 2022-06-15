@@ -26,10 +26,11 @@
 ;;; ir to text
 
 (defun emit (decls)
-  (loop for fn-ir in decls
-        do (format t "~a:" (getf fn-ir :name))
-           (emit-code fn-ir))
-  (emit-data-segment))
+  (let ((*print-case* :downcase))
+    (loop for fn-ir in decls
+          do (format t "~&~a:" (getf fn-ir :name))
+             (emit-code fn-ir))
+    (emit-data-segment)))
 
 (defun emit-data-segment ()
   (format t "~%.data~%")
@@ -51,6 +52,7 @@
             for sym in vars
             for reg in *regs*
             do (setf code (nsubst reg sym code :test 'equal))
+               (format t "~&    # ~3a = ~a~&" reg sym)
             finally (return code))))
 
 (defparameter *branch-insts* '(b bne beq bge ble blt bgt))
@@ -59,8 +61,7 @@
           (replace-vars (append (getf fn-ir :prologue) (getf fn-ir :code))
                         (getf fn-ir :vars))))
     (loop for inst in code
-          do (let ((*print-case* :downcase)
-                   (fn-name (getf fn-ir :name)))
+          do (let ((fn-name (getf fn-ir :name)))
                ;; TODO output comment containing var to register translations
                (case (first inst)
                  (:comment (format t "~&	# ~a~&" (second inst)))
@@ -80,44 +81,48 @@
   (let* ((stack-size 0) ; XXX I don't think I actually need to clean up the stack here
          (prologue (list))
          (*vars*
-           (mapcan (lambda (decl)
-                     (destructuring-bind (_declaration (type) &rest vars)
-                         decl
-                       (declare (ignore _declaration))
-                       ;; TODO support other types (bool, char, double)
-                       (assert (eq type 'weave-c::int))
-                       (loop
-                         for var in vars
-                         collect (if (stringp (second var))
-                                     ;; integer
-                                     (if (null (first var))
-                                         (second var)
-                                         (second (first var)))
-                                     ;; pointer (array N _qualifiers "var")
-                                     (destructuring-bind (_array n _qualifiers name)
-                                         (second (first var))
-                                       (declare (ignore _array _qualifiers))
-                                       (let ((init (gensym "INITSTART"))
-                                             (init-end (gensym "INITEND")))
-                                         (incf stack-size (* n 4))
-                                         (setf prologue
-                                               (nconc prologue
-                                                      `((li $t0 0)
-                                                        (label ,init)
-                                                        (bge $t0 ,n ,init-end)
-                                                        ;; store zero to stack and inc
-                                                        (sw $zero ($sp))
-                                                        (add $sp $sp -4)
-                                                        (add $t0 $t0 1)
-                                                        (b ,init)
-                                                        (label ,init-end)
-                                                        (move ,name $sp)
-                                                        (:comment "body begins..."))))
-                                         name))))))
-                   (traverse-match statements-decls 'weave-c::declaration)))
+           (mapcan
+            (lambda (decl)
+              (destructuring-bind (_declaration (type) &rest vars)
+                  decl
+                (declare (ignore _declaration))
+                ;; TODO support other types (bool, char, double)
+                (assert (eq type 'weave-c::int))
+                (loop
+                  for var in vars
+                  collect (cond ((stringp (second var))
+                                 ;; integer
+                                 (if (null (first var))
+                                     (second var)
+                                     (second (first var))))
+                                ;; assignment initialization
+                                ((stringp (second (first var)))
+                                 (second (first var)))
+                                (t ; XXX assume zero initialization
+                                 (destructuring-bind (_array n _qualifiers name)
+                                     (second (first var))
+                                   (declare (ignore _array _qualifiers))
+                                   (let ((init (gensym "INITSTART"))
+                                         (init-end (gensym "INITEND")))
+                                     (incf stack-size (* n 4))
+                                     (setf prologue
+                                           (nconc prologue
+                                                  `((li $t0 0)
+                                                    (label ,init)
+                                                    (bge $t0 ,n ,init-end)
+                                                    ;; store zero to stack and inc
+                                                    (sw $zero ($sp))
+                                                    (add $sp $sp -4)
+                                                    (add $t0 $t0 1)
+                                                    (b ,init)
+                                                    (label ,init-end)
+                                                    (move ,name $sp)
+                                                    (:comment "body begins..."))))
+                                     name)))))))
+            (tree-collect statements-decls 'weave-c::declaration)))
          (statements (translate-fn-def statements-decls name)))
     (list :name name
-          :vars (print *vars*)
+          :vars *vars*
           :prologue prologue
           :code statements)))
 
@@ -125,9 +130,25 @@
   "ignores declarations, printf/scanf/operators are converted to intrinsics
 supports if/while/for/return"
   (format t "translating ~a..." name)
-  (let ((statements (delete-if (lambda (s) (eq (first s) 'weave-c::declaration))
-                               statements-decls)))
-    (loop for statement in statements
+  (let ((statements
+          (subst-with 'declaration
+                       (lambda (decl)
+                         ;; assume arrays are initialized.
+                         (destructuring-bind (_declaration (type) &rest vars)
+                             decl
+                           (declare (ignore _declaration))
+                           (assert (eq type 'weave-c::int))
+                           ;; XXX assume exactly one initialization per line (good style)
+                           (if (stringp (second (car vars)))
+                               ()
+                               (destructuring-bind ((nil name) (_expr expression))
+                                   (first vars)
+                                 (declare (ignore _expr))
+                                 (unless (listp name) ;(eq (first name) 'array)
+                                   `(weave-c::statement
+                                     (weave-c::expression (= ,name ,expression))))))))
+                       statements-decls)))
+    (loop for statement in (print statements)
           appending (translate-statement statement))))
 
 (defun translate-if (statement end-label)
@@ -159,6 +180,7 @@ supports if/while/for/return"
 (defun translate-statement (statement)
   (let ((thing (second statement)))
     (case (first thing)
+      ((nil))
       (weave-c::if
        (destructuring-bind (condition
                             (_statement (_block &rest if-body))
@@ -296,11 +318,15 @@ supports if/while/for/return"
                      (add ,tmp ,(second expr) ,tmp)
                      (sw ,value (,tmp))))))))
         ;; TODO unary ops, mostly - and ~ and ! (manual translate?)
-        ;; TODO be careful with post++, the expression value is not the original, so
-        ;; just manually convert for now
-        (weave-c::++ (list `(add ,(second expr) ,(second expr) 1)))
-        (weave-c::-- (list `(sub ,(second expr) ,(second expr) 1)))
-        ;; compound assignment ops: XXX don't need the others
+        (weave-c::post-++ `(,@(when target `(move target ,(second expr)))
+                            (add ,(second expr) ,(second expr) 1)))
+        (weave-c::++ `((add ,(second expr) ,(second expr) 1)
+                       ,@(when target `(move target ,(second expr)))))
+        (weave-c::-- `((sub ,(second expr) ,(second expr) 1)
+                       ,@(when target `(move ,target ,(second expr)))))
+        ;; compound assignment ops:
+        ;; XXX these are also expressions, but that's a silly usage
+        ;; XXX not quite correct, evaluates twice but no problem since no side effects
         (weave-c::+= (translate-expression
                         `(weave-c::= ,(second expr)
                                      (weave-c::+ ,(second expr) ,(third expr)))))
@@ -436,7 +462,7 @@ supports if/while/for/return"
 
 ;;; utils, don't look
 
-(defun traverse-match (list symbol)
+(defun tree-collect (list symbol)
   (labels ((rec (list symbol res)
              (when (not (atom list))
                (if (eq (first list) symbol)
@@ -462,3 +488,10 @@ supports if/while/for/return"
                   (push (string (char fmt i)) res))
               (incf i)))
         finally (return (nreverse res))))
+
+(defun subst-with (symbol new tree)
+  (cond
+    ((not (consp tree)) tree)
+    ((eq (car tree) symbol) (funcall new tree))
+    (t (cons (subst-with symbol new (car tree))
+             (subst-with symbol new (cdr tree))))))
